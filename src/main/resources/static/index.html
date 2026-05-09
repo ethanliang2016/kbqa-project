@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>知识库问答系统</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>知识库问答系统</h1>
+            <p class="subtitle">上传文档，智能问答</p>
+        </header>
+
+        <div class="tabs">
+            <button class="tab-btn active" data-tab="documents">文档管理</button>
+            <button class="tab-btn" data-tab="chat">智能问答</button>
+        </div>
+
+        <!-- 文档管理 Tab -->
+        <div id="tab-documents" class="tab-content active">
+            <div class="upload-zone" id="uploadZone">
+                <div class="upload-icon">+</div>
+                <p>拖拽文件到此处，或点击上传</p>
+                <p class="upload-hint">支持 PDF、Word、TXT、Markdown 文件，最大 50MB</p>
+                <input type="file" id="fileInput" accept=".pdf,.docx,.doc,.txt,.md" multiple hidden>
+            </div>
+
+            <div id="uploadProgress" class="upload-progress" style="display:none;">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+                <p id="uploadStatus">上传中...</p>
+            </div>
+
+            <div class="document-list">
+                <h3>已上传文档</h3>
+                <div id="documentList" class="doc-items">
+                    <p class="empty-hint">暂无文档</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- 智能问答 Tab -->
+        <div id="tab-chat" class="tab-content">
+            <div class="chat-container">
+                <div id="chatHistory" class="chat-history">
+                    <div class="chat-welcome">
+                        <p>请先上传文档，然后在此提问。</p>
+                        <p>系统将基于知识库内容为您生成准确回答。</p>
+                    </div>
+                </div>
+
+                <div class="chat-input-area">
+                    <textarea id="questionInput" placeholder="请输入您的问题..." rows="2"></textarea>
+                    <button id="sendBtn" class="send-btn">发送</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/js/app.js"></script>
+</body>
+</html>

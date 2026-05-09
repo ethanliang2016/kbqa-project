@@ -1,0 +1,56 @@
+server:
+  port: 0
+
+spring:
+  ai:
+    dashscope:
+      api-key: test-api-key
+      chat:
+        options:
+          model: qwen-plus
+      embedding:
+        options:
+          model: text-embedding-v3
+          dimensions: 1024
+    milvus:
+      client:
+        host: 192.168.1.47
+        port: 19530
+      collection:
+        name: kbqa_documents_test
+      embedding:
+        dimension: 1024
+
+kbqa:
+  document:
+    upload-dir: ./test-uploads
+    allowed-types: pdf,docx,doc,txt,md
+    max-size: 52428800
+    pdf-parsing:
+      detect-image-only: false
+      strip-headers-footers: false
+      header-footer-lines: 2
+  chunking:
+    chunk-size: 500
+    chunk-overlap: 75
+    filter-invalid-chunks: false
+    min-chunk-chars: 10
+    max-special-symbol-ratio: 0.5
+  retrieval:
+    top-k: 5
+    similarity-threshold: 0.5
+  dedup:
+    enabled: true
+    content-hash: true
+    semantic-similarity: false
+    semantic-threshold: 0.95
+  embedding:
+    max-retries: 1
+    retry-interval-ms: 100
+    retry-backoff-multiplier: 2.0
+    timeout-seconds: 10
+  rerank:
+    enabled: false
+    model: gte-rerank
+    top-n: 3
+    score-threshold: 0.0

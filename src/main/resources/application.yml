@@ -1,0 +1,91 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: kbqa-project
+
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+
+  ai:
+    dashscope:
+      api-key: ${DASHSCOPE_API_KEY:}
+      chat:
+        options:
+          model: qwen-plus
+          temperature: 0.7
+      embedding:
+        options:
+          model: text-embedding-v3
+          dimensions: 1024
+
+    milvus:
+      client:
+        host: 192.168.1.47
+        port: 19530
+      collection:
+        name: kbqa_documents
+      embedding:
+        dimension: 1024
+      index:
+        type: IVF_FLAT
+        metric-type: COSINE
+      content-field-name: content
+      metadata-field-name: metadata
+
+kbqa:
+  document:
+    upload-dir: ./uploads
+    allowed-types: pdf,docx,doc,txt,md
+    max-size: 52428800
+    pdf-parsing:
+      detect-image-only: true
+      strip-headers-footers: true
+      header-footer-lines: 2
+  chunking:
+    chunk-size: 500
+    chunk-overlap: 75
+    filter-invalid-chunks: true
+    min-chunk-chars: 10
+    max-special-symbol-ratio: 0.5
+  retrieval:
+    top-k: 5
+    similarity-threshold: 0.5
+  dedup:
+    enabled: true
+    content-hash: true
+    semantic-similarity: false
+    semantic-threshold: 0.95
+  embedding:
+    max-retries: 3
+    retry-interval-ms: 1000
+    retry-backoff-multiplier: 2.0
+    timeout-seconds: 30
+  rerank:
+    enabled: false
+    model: gte-rerank
+    top-n: 3
+    score-threshold: 0.0
+  prompt:
+    system-template: |
+      你是一个知识库问答助手。请根据以下参考资料回答用户的问题。
+      如果参考资料中没有相关信息，请明确说明"根据已有知识库无法回答该问题"，不要编造答案。
+      回答时请引用来源文档名称。
+
+      参考资料：
+      {context}
+
+      用户问题：{question}
+
+      请给出准确、完整的回答：
+
+logging:
+  level:
+    com.kbqa: DEBUG
+    org.springframework.ai: INFO
+    io.milvus: WARN
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
