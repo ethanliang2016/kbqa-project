@@ -4,12 +4,16 @@ import io.milvus.client.MilvusServiceClient;
 import io.milvus.param.ConnectParam;
 import io.milvus.param.IndexType;
 import io.milvus.param.MetricType;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.vectorstore.milvus.MilvusVectorStore;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Lazy;
 
+@Slf4j
 @Configuration
 public class MilvusConfig {
 
@@ -34,19 +38,27 @@ public class MilvusConfig {
     @Value("${spring.ai.milvus.metadata-field-name:metadata}")
     private String metadataFieldName;
 
-    @Bean
+    @Lazy
+    @Bean(destroyMethod = "close")
     public MilvusServiceClient milvusServiceClient() {
+        log.info("[MILVUS] Connecting to {}:{}", host, port);
         ConnectParam connectParam = ConnectParam.newBuilder()
                 .withHost(host)
                 .withPort(port)
+                .withConnectTimeout(10000, java.util.concurrent.TimeUnit.MILLISECONDS)
+                .withKeepAliveTime(55000, java.util.concurrent.TimeUnit.MILLISECONDS)
+                .withIdleTimeout(86400, java.util.concurrent.TimeUnit.MILLISECONDS)
                 .build();
         return new MilvusServiceClient(connectParam);
     }
 
+    @Lazy
     @Bean
-    public MilvusVectorStore milvusVectorStore(MilvusServiceClient milvusServiceClient,
-                                               EmbeddingModel embeddingModel) {
-        return MilvusVectorStore.builder(milvusServiceClient, embeddingModel)
+    public MilvusVectorStore milvusVectorStore(ObjectProvider<MilvusServiceClient> milvusServiceClientProvider,
+                                               ObjectProvider<EmbeddingModel> embeddingModelProvider) {
+        MilvusServiceClient client = milvusServiceClientProvider.getObject();
+        EmbeddingModel embeddingModel = embeddingModelProvider.getObject();
+        return MilvusVectorStore.builder(client, embeddingModel)
                 .collectionName(collectionName)
                 .databaseName(databaseName)
                 .embeddingDimension(embeddingDimension)

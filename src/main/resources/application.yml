@@ -10,9 +10,22 @@ spring:
       max-file-size: 50MB
       max-request-size: 50MB
 
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:}:${MYSQL_PORT:3306}/${MYSQL_DATABASE:kbqa}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=utf-8
+    username: ${MYSQL_USERNAME:root}
+    password: ${MYSQL_PASSWORD:}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  data:
+    redis:
+      host: ${REDIS_HOST:}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 3000ms
+
   ai:
     dashscope:
-      api-key: ${DASHSCOPE_API_KEY:}
+      api-key:
       chat:
         options:
           model: qwen-plus
@@ -24,7 +37,7 @@ spring:
 
     milvus:
       client:
-        host: 192.168.1.47
+        host: 
         port: 19530
       collection:
         name: kbqa_documents
@@ -35,6 +48,17 @@ spring:
         metric-type: COSINE
       content-field-name: content
       metadata-field-name: metadata
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.nologging.NoLoggingImpl
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
 
 kbqa:
   document:

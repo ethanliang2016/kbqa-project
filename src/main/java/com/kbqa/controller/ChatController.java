@@ -6,11 +6,14 @@ import com.kbqa.service.ChatService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import reactor.core.publisher.Flux;
 
 @Slf4j
 @RestController
@@ -29,12 +32,9 @@ public class ChatController {
         return ResponseEntity.ok(response);
     }
 
-    @PostMapping("/stream")
-    public ResponseEntity<ChatResponse> chatStream(@Valid @RequestBody ChatRequest request) {
+    @PostMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<ServerSentEvent<String>> chatStream(@Valid @RequestBody ChatRequest request) {
         log.info("[API] Stream chat request received: questionLength={}chars", request.getQuestion().length());
-        ChatResponse response = chatService.chatStream(request);
-        log.info("[API] Stream chat response sent: sources={}, answerLength={}chars",
-                response.getSources().size(), response.getAnswer().length());
-        return ResponseEntity.ok(response);
+        return chatService.chatStreamSSE(request);
     }
 }

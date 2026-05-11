@@ -1,5 +1,7 @@
 package com.kbqa.service.impl;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.kbqa.config.KbqaProperties;
 import com.kbqa.exception.ChatException;
 import com.kbqa.exception.ErrorCode;
@@ -9,26 +11,43 @@ import com.kbqa.model.ChatResponse.SourceReference;
 import com.kbqa.service.ChatService;
 import com.kbqa.service.RerankService;
 import java.util.List;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.chat.model.StreamingChatModel;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class ChatServiceImpl implements ChatService {
 
     private final VectorStore vectorStore;
     private final ChatModel chatModel;
+    private final StreamingChatModel streamingChatModel;
     private final KbqaProperties properties;
     private final RerankService rerankService;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    public ChatServiceImpl(@Lazy VectorStore vectorStore,
+                           @Lazy ChatModel chatModel,
+                           @Lazy StreamingChatModel streamingChatModel,
+                           KbqaProperties properties,
+                           @Lazy RerankService rerankService) {
+        this.vectorStore = vectorStore;
+        this.chatModel = chatModel;
+        this.streamingChatModel = streamingChatModel;
+        this.properties = properties;
+        this.rerankService = rerankService;
+    }
 
     @Override
     public ChatResponse chat(ChatRequest request) {
@@ -40,7 +59,6 @@ public class ChatServiceImpl implements ChatService {
         List<Document> retrievedDocs = retrieveDocuments(question);
         long retrievalTime = System.currentTimeMillis() - start;
 
-        // Rerank
         if (properties.getRerank().isEnabled() && !retrievedDocs.isEmpty()) {
             start = System.currentTimeMillis();
             retrievedDocs = rerankService.rerank(question, retrievedDocs);
@@ -54,15 +72,7 @@ public class ChatServiceImpl implements ChatService {
         String answer = generateAnswer(question, context);
         long generationTime = System.currentTimeMillis() - start;
 
-        List<SourceReference> sources = retrievedDocs.stream()
-                .map(doc -> SourceReference.builder()
-                        .filename((String) doc.getMetadata().getOrDefault("filename", "unknown"))
-                        .similarity(doc.getMetadata().getOrDefault("distance", 0.0) instanceof Number n
-                                ? 1.0 - n.doubleValue()
-                                : 0.0)
-                        .content(truncate(doc.getText(), 200))
-                        .build())
-                .toList();
+        List<SourceReference> sources = buildSources(retrievedDocs);
 
         log.info("[CHAT] Completed: sources={}, retrievalTime={}ms, generationTime={}ms, answerLength={}chars",
                 sources.size(), retrievalTime, generationTime, answer.length());
@@ -74,8 +84,68 @@ public class ChatServiceImpl implements ChatService {
     }
 
     @Override
-    public ChatResponse chatStream(ChatRequest request) {
-        return chat(request);
+    public Flux<ServerSentEvent<String>> chatStreamSSE(ChatRequest request) {
+        String question = request.getQuestion();
+        log.info("[CHAT-STREAM] Processing streaming question: length={}chars", question.length());
+
+        List<Document> retrievedDocs = retrieveDocuments(question);
+
+        if (properties.getRerank().isEnabled() && !retrievedDocs.isEmpty()) {
+            retrievedDocs = rerankService.rerank(question, retrievedDocs);
+            log.info("[CHAT-STREAM] Rerank completed: docs={}", retrievedDocs.size());
+        }
+
+        List<SourceReference> sources = buildSources(retrievedDocs);
+        String context = buildContext(retrievedDocs);
+
+        String systemTemplate = properties.getPrompt().getSystemTemplate();
+        String systemContent = systemTemplate
+                .replace("{context}", context)
+                .replace("{question}", question);
+        SystemMessage systemMessage = new SystemMessage(systemContent);
+        UserMessage userMessage = new UserMessage(question);
+        Prompt prompt = new Prompt(List.of(systemMessage, userMessage));
+
+        String sourcesJson;
+        try {
+            sourcesJson = objectMapper.writeValueAsString(sources);
+        } catch (JsonProcessingException e) {
+            log.error("[CHAT-STREAM] Failed to serialize sources", e);
+            sourcesJson = "[]";
+        }
+
+        ServerSentEvent<String> sourcesEvent = ServerSentEvent
+                .<String>builder()
+                .event("sources")
+                .data(sourcesJson)
+                .build();
+
+        Flux<ServerSentEvent<String>> tokenEvents = streamingChatModel.stream(prompt)
+                .map(chatResponse -> {
+                    String token = "";
+                    if (chatResponse.getResult() != null
+                            && chatResponse.getResult().getOutput() != null
+                            && chatResponse.getResult().getOutput().getText() != null) {
+                        token = chatResponse.getResult().getOutput().getText();
+                    }
+                    return ServerSentEvent.<String>builder()
+                            .event("token")
+                            .data(token)
+                            .build();
+                })
+                .filter(sse -> sse.data() != null && !sse.data().isEmpty());
+
+        ServerSentEvent<String> doneEvent = ServerSentEvent
+                .<String>builder()
+                .event("done")
+                .data("[DONE]")
+                .build();
+
+        return Flux.concat(
+                Flux.just(sourcesEvent),
+                tokenEvents,
+                Flux.just(doneEvent)
+        );
     }
 
     private List<Document> retrieveDocuments(String question) {
@@ -126,6 +196,18 @@ public class ChatServiceImpl implements ChatService {
         }
         log.debug("[CONTEXT] Built context from {} documents, contextLength={}chars", documents.size(), sb.length());
         return sb.toString();
+    }
+
+    private List<SourceReference> buildSources(List<Document> retrievedDocs) {
+        return retrievedDocs.stream()
+                .map(doc -> SourceReference.builder()
+                        .filename((String) doc.getMetadata().getOrDefault("filename", "unknown"))
+                        .similarity(doc.getMetadata().getOrDefault("distance", 0.0) instanceof Number n
+                                ? 1.0 - n.doubleValue()
+                                : 0.0)
+                        .content(truncate(doc.getText(), 200))
+                        .build())
+                .toList();
     }
 
     private String generateAnswer(String question, String context) {

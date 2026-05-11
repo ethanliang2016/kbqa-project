@@ -145,47 +145,89 @@ document.addEventListener('DOMContentLoaded', () => {
         questionInput.value = '';
         sendBtn.disabled = true;
 
-        // Show loading
-        const loadingId = 'loading-' + Date.now();
-        const loadingDiv = document.createElement('div');
-        loadingDiv.id = loadingId;
-        loadingDiv.className = 'chat-message';
-        loadingDiv.innerHTML = '<div class="message-answer"><span class="loading"></span>正在思考...</div>';
-        chatHistory.appendChild(loadingDiv);
+        // Create answer container with loading indicator
+        const answerDiv = document.createElement('div');
+        answerDiv.className = 'chat-message';
+        answerDiv.innerHTML = '<div class="message-label">回答：</div>'
+            + '<div class="message-answer"><span class="loading"></span>正在思考...</div>'
+            + '<div class="message-sources" style="display:none;">来源：</div>';
+        chatHistory.appendChild(answerDiv);
         chatHistory.scrollTop = chatHistory.scrollHeight;
 
+        const answerEl = answerDiv.querySelector('.message-answer');
+        const sourcesEl = answerDiv.querySelector('.message-sources');
+        let fullAnswer = '';
+
         try {
-            const response = await fetch('/api/chat', {
+            const response = await fetch('/api/chat/stream', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ question: question })
             });
 
-            const result = await response.json();
-
-            // Remove loading
-            document.getElementById(loadingId).remove();
-
-            // Show answer
-            const answerDiv = document.createElement('div');
-            answerDiv.className = 'chat-message';
-            let html = '<div class="message-label">回答：</div>';
-            html += '<div class="message-answer">' + escapeHtml(result.answer) + '</div>';
-
-            if (result.sources && result.sources.length > 0) {
-                html += '<div class="message-sources">来源：';
-                result.sources.forEach(s => {
-                    html += '<span class="source-tag">' + escapeHtml(s.filename)
-                        + ' (' + (s.similarity * 100).toFixed(1) + '%)</span>';
-                });
-                html += '</div>';
+            if (!response.ok) {
+                const err = await response.json();
+                throw new Error(err.message || '请求失败');
             }
 
-            answerDiv.innerHTML = html;
-            chatHistory.appendChild(answerDiv);
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const parts = buffer.split('\n\n');
+                buffer = parts.pop();
+
+                for (const part of parts) {
+                    if (!part.trim()) continue;
+
+                    let eventType = '';
+                    let eventData = '';
+
+                    for (const line of part.split('\n')) {
+                        if (line.startsWith('event:')) {
+                            eventType = line.substring(6).trim();
+                        } else if (line.startsWith('data:')) {
+                            eventData = line.substring(5).trim();
+                        }
+                    }
+
+                    if (eventType === 'sources') {
+                        try {
+                            const sources = JSON.parse(eventData);
+                            if (sources && sources.length > 0) {
+                                sourcesEl.style.display = 'block';
+                                let html = '来源：';
+                                sources.forEach(s => {
+                                    html += '<span class="source-tag">' + escapeHtml(s.filename)
+                                        + ' (' + (s.similarity * 100).toFixed(1) + '%)</span>';
+                                });
+                                sourcesEl.innerHTML = html;
+                            }
+                        } catch (e) {
+                            console.error('Failed to parse sources:', e);
+                        }
+                    } else if (eventType === 'token') {
+                        if (fullAnswer === '') {
+                            answerEl.textContent = '';
+                        }
+                        fullAnswer += eventData;
+                        answerEl.textContent = fullAnswer;
+                        chatHistory.scrollTop = chatHistory.scrollHeight;
+                    } else if (eventType === 'done') {
+                        if (fullAnswer === '') {
+                            answerEl.textContent = '（未获取到回答）';
+                        }
+                    }
+                }
+            }
+
         } catch (err) {
-            document.getElementById(loadingId).remove();
-            appendMessage('answer', '请求失败：' + err.message);
+            answerEl.innerHTML = '<span class="error">请求失败：' + escapeHtml(err.message) + '</span>';
         }
 
         sendBtn.disabled = false;

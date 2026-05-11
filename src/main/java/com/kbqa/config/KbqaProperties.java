@@ -69,6 +69,7 @@ public class KbqaProperties {
         private boolean contentHash = true;
         private boolean semanticSimilarity = false;
         private double semanticThreshold = 0.95;
+        private long contentHashTtlDays = 7;
     }
 
     @Data

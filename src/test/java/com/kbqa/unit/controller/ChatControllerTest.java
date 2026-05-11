@@ -17,8 +17,10 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.http.MediaType;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.web.servlet.MockMvc;
+import reactor.core.publisher.Flux;
 
 @WebMvcTest(ChatController.class)
 @ContextConfiguration(classes = {ChatController.class, GlobalExceptionHandler.class})
@@ -78,17 +80,19 @@ class ChatControllerTest {
         ChatRequest request = new ChatRequest();
         request.setQuestion("测试流式问答");
 
-        ChatResponse response = ChatResponse.builder()
-                .answer("流式回答内容")
-                .sources(java.util.Collections.emptyList())
-                .build();
+        ServerSentEvent<String> sourceEvent = ServerSentEvent
+                .<String>builder().event("sources").data("[]").build();
+        ServerSentEvent<String> tokenEvent = ServerSentEvent
+                .<String>builder().event("token").data("测试").build();
+        ServerSentEvent<String> doneEvent = ServerSentEvent
+                .<String>builder().event("done").data("[DONE]").build();
 
-        when(chatService.chatStream(any())).thenReturn(response);
+        when(chatService.chatStreamSSE(any()))
+                .thenReturn(Flux.just(sourceEvent, tokenEvent, doneEvent));
 
         mockMvc.perform(post("/api/chat/stream")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.answer").value("流式回答内容"));
+                .andExpect(status().isOk());
     }
 }

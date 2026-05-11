@@ -24,10 +24,13 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.chat.model.StreamingChatModel;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.http.codec.ServerSentEvent;
+import reactor.core.publisher.Flux;
 
 @ExtendWith(MockitoExtension.class)
 class ChatServiceImplTest {
@@ -37,6 +40,9 @@ class ChatServiceImplTest {
 
     @Mock
     private ChatModel chatModel;
+
+    @Mock
+    private StreamingChatModel streamingChatModel;
 
     @Mock
     private RerankService rerankService;
@@ -50,7 +56,7 @@ class ChatServiceImplTest {
         properties.getRetrieval().setTopK(5);
         properties.getRetrieval().setSimilarityThreshold(0.5);
 
-        service = new ChatServiceImpl(vectorStore, chatModel, properties, rerankService);
+        service = new ChatServiceImpl(vectorStore, chatModel, streamingChatModel, properties, rerankService);
     }
 
     @Test
@@ -142,5 +148,63 @@ class ChatServiceImplTest {
         request.setQuestion("测试问题");
 
         assertThrows(ChatException.class, () -> service.chat(request));
+    }
+
+    @Test
+    void chatStreamSSE_withRetrievedDocs() {
+        Map<String, Object> metadata = new HashMap<>();
+        metadata.put("filename", "test.pdf");
+        metadata.put("distance", 0.2);
+        Document doc = new Document("Test content", metadata);
+        when(vectorStore.similaritySearch(any(SearchRequest.class))).thenReturn(List.of(doc));
+
+        org.springframework.ai.chat.messages.AssistantMessage msg1 =
+                new org.springframework.ai.chat.messages.AssistantMessage("你好");
+        org.springframework.ai.chat.model.Generation gen1 =
+                new org.springframework.ai.chat.model.Generation(msg1);
+        org.springframework.ai.chat.model.ChatResponse chunk1 =
+                new org.springframework.ai.chat.model.ChatResponse(List.of(gen1));
+
+        when(streamingChatModel.stream(any(Prompt.class)))
+                .thenReturn(Flux.just(chunk1));
+
+        ChatRequest request = new ChatRequest();
+        request.setQuestion("测试问题");
+
+        List<ServerSentEvent<String>> events =
+                service.chatStreamSSE(request).collectList().block();
+
+        assertNotNull(events);
+        assertEquals(3, events.size());
+        assertEquals("sources", events.get(0).event());
+        assertEquals("token", events.get(1).event());
+        assertEquals("你好", events.get(1).data());
+        assertEquals("done", events.get(2).event());
+    }
+
+    @Test
+    void chatStreamSSE_noRelevantDocs() {
+        when(vectorStore.similaritySearch(any(SearchRequest.class)))
+                .thenReturn(new ArrayList<>());
+
+        org.springframework.ai.chat.messages.AssistantMessage msg =
+                new org.springframework.ai.chat.messages.AssistantMessage("无法回答");
+        org.springframework.ai.chat.model.Generation gen =
+                new org.springframework.ai.chat.model.Generation(msg);
+        org.springframework.ai.chat.model.ChatResponse chunk =
+                new org.springframework.ai.chat.model.ChatResponse(List.of(gen));
+
+        when(streamingChatModel.stream(any(Prompt.class)))
+                .thenReturn(Flux.just(chunk));
+
+        ChatRequest request = new ChatRequest();
+        request.setQuestion("不存在的问题");
+
+        List<ServerSentEvent<String>> events =
+                service.chatStreamSSE(request).collectList().block();
+
+        assertNotNull(events);
+        assertEquals(3, events.size());
+        assertEquals("[]", events.get(0).data());
     }
 }

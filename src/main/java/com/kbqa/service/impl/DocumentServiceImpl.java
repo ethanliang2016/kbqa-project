@@ -1,10 +1,16 @@
 package com.kbqa.service.impl;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.kbqa.config.KbqaProperties;
 import com.kbqa.config.KbqaProperties.Dedup;
+import com.kbqa.entity.DocumentChunkEntity;
+import com.kbqa.entity.DocumentEntity;
 import com.kbqa.exception.DocumentProcessingException;
 import com.kbqa.exception.DuplicateDocumentException;
 import com.kbqa.exception.ErrorCode;
+import com.kbqa.mapper.DocumentChunkMapper;
+import com.kbqa.mapper.DocumentMapper;
 import com.kbqa.model.DocumentInfo;
 import com.kbqa.model.DocumentUploadResponse;
 import com.kbqa.parser.DocumentParser;
@@ -20,31 +26,47 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HexFormat;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import lombok.RequiredArgsConstructor;
+import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.transformer.splitter.TokenTextSplitter;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class DocumentServiceImpl implements DocumentService {
+
+    private static final String REDIS_KEY_PREFIX = "kbqa:dedup:hash:";
 
     private final VectorStore vectorStore;
     private final List<DocumentParser> parsers;
     private final KbqaProperties properties;
+    private final DocumentMapper documentMapper;
+    private final DocumentChunkMapper documentChunkMapper;
+    private final StringRedisTemplate redisTemplate;
 
-    private final Map<String, DocumentInfo> documentStore = new HashMap<>();
-    private final Map<String, List<String>> docChunkIds = new HashMap<>();
-    private final Map<String, String> contentHashMap = new HashMap<>();
+    public DocumentServiceImpl(@Lazy VectorStore vectorStore,
+                               List<DocumentParser> parsers,
+                               KbqaProperties properties,
+                               DocumentMapper documentMapper,
+                               DocumentChunkMapper documentChunkMapper,
+                               StringRedisTemplate redisTemplate) {
+        this.vectorStore = vectorStore;
+        this.parsers = parsers;
+        this.properties = properties;
+        this.documentMapper = documentMapper;
+        this.documentChunkMapper = documentChunkMapper;
+        this.redisTemplate = redisTemplate;
+    }
 
     @Override
     public DocumentUploadResponse uploadDocument(MultipartFile file) {
@@ -66,7 +88,6 @@ public class DocumentServiceImpl implements DocumentService {
         String contentHash = sha256(content);
         log.debug("[UPLOAD] Content hash computed: filename={}, hash={}", filename, contentHash);
 
-        // 第一层：内容哈希去重
         if (dedup.isEnabled() && dedup.isContentHash()) {
             checkContentHashDuplicate(contentHash, filename);
             log.info("[UPLOAD] Content hash dedup passed: filename={}", filename);
@@ -78,7 +99,6 @@ public class DocumentServiceImpl implements DocumentService {
         List<Document> chunks = splitIntoChunks(content, filename, docId, uploadTime, contentHash);
         log.info("[UPLOAD] Document split into chunks: docId={}, chunkCount={}", docId, chunks.size());
 
-        // 第二层：chunk 级语义相似度去重
         List<Document> chunksToStore = chunks;
         if (dedup.isEnabled() && dedup.isSemanticSimilarity()) {
             start = System.currentTimeMillis();
@@ -99,18 +119,31 @@ public class DocumentServiceImpl implements DocumentService {
         log.info("[UPLOAD] Chunks stored to Milvus: count={}, elapsed={}ms",
                 chunksToStore.size(), System.currentTimeMillis() - start);
 
-        List<String> chunkIdList = chunksToStore.stream().map(Document::getId).toList();
-        docChunkIds.put(docId, chunkIdList);
-
-        DocumentInfo info = DocumentInfo.builder()
+        // Save document metadata to MySQL
+        DocumentEntity docEntity = DocumentEntity.builder()
                 .docId(docId)
                 .filename(filename)
-                .uploadTime(uploadTime)
+                .uploadTime(LocalDateTime.parse(uploadTime, DateTimeFormatter.ISO_LOCAL_DATE_TIME))
                 .chunkCount(chunksToStore.size())
                 .contentHash(contentHash)
                 .build();
-        documentStore.put(docId, info);
-        contentHashMap.put(contentHash, docId);
+        documentMapper.insert(docEntity);
+
+        // Save chunk IDs to MySQL
+        List<String> chunkIdList = chunksToStore.stream().map(Document::getId).toList();
+        for (String chunkId : chunkIdList) {
+            documentChunkMapper.insert(DocumentChunkEntity.builder()
+                    .docId(docId)
+                    .chunkId(chunkId)
+                    .build());
+        }
+
+        // Save content hash to Redis with TTL
+        if (contentHash != null) {
+            long ttlDays = properties.getDedup().getContentHashTtlDays();
+            redisTemplate.opsForValue().set(
+                    REDIS_KEY_PREFIX + contentHash, docId, ttlDays, TimeUnit.DAYS);
+        }
 
         saveOriginalFile(file, docId, filename);
 
@@ -127,80 +160,104 @@ public class DocumentServiceImpl implements DocumentService {
 
     @Override
     public List<DocumentInfo> listDocuments() {
-        List<DocumentInfo> docs = new ArrayList<>(documentStore.values());
+        List<DocumentEntity> entities = documentMapper.selectList(null);
+        List<DocumentInfo> docs = entities.stream()
+                .map(this::toDocumentInfo)
+                .toList();
         log.debug("[LIST] Returning {} documents", docs.size());
         return docs;
     }
 
     @Override
+    @Transactional
     public void deleteDocument(String docId) {
         log.info("[DELETE] Deleting document: docId={}", docId);
 
-        DocumentInfo info = documentStore.remove(docId);
-        if (info == null) {
-            log.warn("[DELETE] Document not found: docId={}", docId);
+        DocumentEntity docEntity = documentMapper.selectOne(
+                new LambdaQueryWrapper<DocumentEntity>().eq(DocumentEntity::getDocId, docId));
+        if (docEntity == null) {
             throw new DocumentProcessingException(ErrorCode.DOC_NOT_FOUND, docId);
         }
 
-        // 同步清理哈希索引
-        if (info.getContentHash() != null) {
-            contentHashMap.remove(info.getContentHash());
-            log.debug("[DELETE] Content hash index removed: hash={}", info.getContentHash());
+        // Clean up Redis content-hash index
+        if (docEntity.getContentHash() != null) {
+            redisTemplate.delete(REDIS_KEY_PREFIX + docEntity.getContentHash());
+            log.debug("[DELETE] Content hash index removed from Redis: hash={}", docEntity.getContentHash());
         }
 
-        List<String> chunkIds = docChunkIds.remove(docId);
-        if (chunkIds != null && !chunkIds.isEmpty()) {
+        // Get chunk IDs for Milvus deletion
+        List<DocumentChunkEntity> chunkEntities = documentChunkMapper.selectList(
+                new LambdaQueryWrapper<DocumentChunkEntity>().eq(DocumentChunkEntity::getDocId, docId));
+        List<String> chunkIds = chunkEntities.stream()
+                .map(DocumentChunkEntity::getChunkId)
+                .toList();
+
+        if (!chunkIds.isEmpty()) {
             try {
                 long start = System.currentTimeMillis();
                 vectorStore.delete(chunkIds);
                 log.info("[DELETE] Document deleted from Milvus: docId={}, filename={}, chunks={}, elapsed={}ms",
-                        docId, info.getFilename(), chunkIds.size(), System.currentTimeMillis() - start);
+                        docId, docEntity.getFilename(), chunkIds.size(), System.currentTimeMillis() - start);
             } catch (Exception e) {
                 log.error("[DELETE] Failed to delete chunks from Milvus: docId={}, filename={}, chunkCount={}",
-                        docId, info.getFilename(), chunkIds.size(), e);
-                throw new DocumentProcessingException(ErrorCode.DOC_DELETE_FAILED, info.getFilename(), e);
+                        docId, docEntity.getFilename(), chunkIds.size(), e);
+                throw new DocumentProcessingException(ErrorCode.DOC_DELETE_FAILED, docEntity.getFilename(), e);
             }
         } else {
-            log.warn("[DELETE] No chunk IDs found for document: docId={}, filename={}", docId, info.getFilename());
+            log.warn("[DELETE] No chunk IDs found for document: docId={}, filename={}", docId, docEntity.getFilename());
         }
+
+        documentChunkMapper.delete(
+                new LambdaQueryWrapper<DocumentChunkEntity>().eq(DocumentChunkEntity::getDocId, docId));
+        documentMapper.delete(
+                new LambdaQueryWrapper<DocumentEntity>().eq(DocumentEntity::getDocId, docId));
+
+        log.info("[DELETE] Document deleted from MySQL: docId={}, filename={}", docId, docEntity.getFilename());
     }
 
     private void checkContentHashDuplicate(String contentHash, String filename) {
-        // 先查内存索引
-        if (contentHashMap.containsKey(contentHash)) {
-            String existingDocId = contentHashMap.get(contentHash);
-            DocumentInfo existing = documentStore.get(existingDocId);
-            String existingName = existing != null ? existing.getFilename() : existingDocId;
-            log.warn("[DEDUP-HASH] Duplicate detected via memory index: currentFile={}, existingFile={}, existingDocId={}",
-                    filename, existingName, existingDocId);
-            throw new DuplicateDocumentException(
-                    "文档内容重复，已存在相同内容的文档: " + existingName, existingName);
-        }
+        String redisKey = REDIS_KEY_PREFIX + contentHash;
 
-        // 兜底：查 Milvus 元数据（防止重启后内存索引丢失）
+        // Level 1: Check Redis (fast path)
         try {
-            List<Document> existing = vectorStore.similaritySearch(
-                    SearchRequest.builder()
-                            .query("contentHash:" + contentHash)
-                            .topK(1)
-                            .similarityThreshold(0.0)
-                            .build());
-            for (Document doc : existing) {
-                if (contentHash.equals(doc.getMetadata().get("contentHash"))) {
-                    String existingName = (String) doc.getMetadata().getOrDefault("filename", "unknown");
-                    log.warn("[DEDUP-HASH] Duplicate detected via Milvus metadata: currentFile={}, existingFile={}",
-                            filename, existingName);
-                    throw new DuplicateDocumentException(
-                            "文档内容重复，已存在相同内容的文档: " + existingName, existingName);
-                }
+            String existingDocId = redisTemplate.opsForValue().get(redisKey);
+            if (existingDocId != null) {
+                DocumentEntity existing = documentMapper.selectOne(
+                        new LambdaQueryWrapper<DocumentEntity>().eq(DocumentEntity::getDocId, existingDocId));
+                String existingName = existing != null ? existing.getFilename() : existingDocId;
+                log.warn("[DEDUP-HASH] Duplicate detected via Redis: currentFile={}, existingFile={}, existingDocId={}",
+                        filename, existingName, existingDocId);
+                throw new DuplicateDocumentException(
+                        "文档内容重复，已存在相同内容的文档: " + existingName, existingName);
             }
-            log.debug("[DEDUP-HASH] No duplicate found in Milvus: filename={}, hash={}", filename, contentHash);
         } catch (DuplicateDocumentException e) {
             throw e;
         } catch (Exception e) {
-            log.warn("[DEDUP-HASH] Milvus metadata check failed, skipping: filename={}, error={}",
+            log.warn("[DEDUP-HASH] Redis check failed, falling back to MySQL: filename={}, error={}",
                     filename, e.getMessage());
         }
+
+        // Level 2: Check MySQL (reliable fallback)
+        try {
+            Long count = documentMapper.selectCount(
+                    new LambdaQueryWrapper<DocumentEntity>().eq(DocumentEntity::getContentHash, contentHash));
+            if (count != null && count > 0) {
+                DocumentEntity existing = documentMapper.selectOne(
+                        new LambdaQueryWrapper<DocumentEntity>().eq(DocumentEntity::getContentHash, contentHash));
+                String existingName = existing != null ? existing.getFilename() : "unknown";
+                log.warn("[DEDUP-HASH] Duplicate detected via MySQL: currentFile={}, existingFile={}",
+                        filename, existingName);
+                throw new DuplicateDocumentException(
+                        "文档内容重复，已存在相同内容的文档: " + existingName, existingName);
+            }
+        } catch (DuplicateDocumentException e) {
+            throw e;
+        } catch (Exception e) {
+            log.warn("[DEDUP-HASH] MySQL check failed, skipping dedup: filename={}, error={}",
+                    filename, e.getMessage());
+        }
+
+        log.debug("[DEDUP-HASH] No duplicate found: filename={}, hash={}", filename, contentHash);
     }
 
     private List<Document> filterSemanticDuplicates(List<Document> chunks, double threshold) {
@@ -349,6 +406,16 @@ public class DocumentServiceImpl implements DocumentService {
         } catch (IOException e) {
             log.error("[SAVE] Failed to save original file: filename={}, error={}", filename, e.getMessage(), e);
         }
+    }
+
+    private DocumentInfo toDocumentInfo(DocumentEntity entity) {
+        return DocumentInfo.builder()
+                .docId(entity.getDocId())
+                .filename(entity.getFilename())
+                .uploadTime(entity.getUploadTime().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
+                .chunkCount(entity.getChunkCount())
+                .contentHash(entity.getContentHash())
+                .build();
     }
 
     private String sha256(String text) {
